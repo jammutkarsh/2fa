@@ -35,7 +35,7 @@
 //
 // The keychain is stored unencrypted in the text file $HOME/.2fa.
 //
-// Example
+// # Example
 //
 // During GitHub 2FA setup, at the “Scan this barcode with your app” step,
 // click the “enter this text code instead” link. A window pops up showing
@@ -58,7 +58,6 @@
 //	$ 2fa
 //	268346	github
 //	$
-//
 package main
 
 import (
@@ -81,22 +80,24 @@ import (
 	"unicode"
 
 	"github.com/atotto/clipboard"
+	"github.com/lithammer/fuzzysearch/fuzzy"
 )
 
 var (
-	flagAdd  = flag.Bool("add", false, "add a key")
-	flagList = flag.Bool("list", false, "list keys")
-	flagHotp = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
-	flag7    = flag.Bool("7", false, "generate 7-digit code")
-	flag8    = flag.Bool("8", false, "generate 8-digit code")
-	flagClip = flag.Bool("clip", false, "copy code to the clipboard")
+	flagAdd    = flag.Bool("add", false, "add a key")
+	flagList   = flag.Bool("list", false, "list keys")
+	flagHotp   = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
+	flag7      = flag.Bool("7", false, "generate 7-digit code")
+	flag8      = flag.Bool("8", false, "generate 8-digit code")
+	flagImport = flag.Bool("import", false, "import keys from file")
 )
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] [-hotp] keyname\n")
 	fmt.Fprintf(os.Stderr, "\t2fa -list\n")
-	fmt.Fprintf(os.Stderr, "\t2fa [-clip] keyname\n")
+	fmt.Fprintf(os.Stderr, "\t2fa keyname\n")
+	fmt.Fprintf(os.Stderr, "\t2fa -import 2fas <file>\n")
 	os.Exit(2)
 }
 
@@ -115,10 +116,19 @@ func main() {
 		k.list()
 		return
 	}
-	if flag.NArg() == 0 && !*flagAdd {
-		if *flagClip {
+	if *flagImport {
+		if flag.NArg() != 2 {
 			usage()
 		}
+		format := flag.Arg(0)
+		file := flag.Arg(1)
+		if format != "2fas" {
+			log.Fatalf("unsupported import format: %s", format)
+		}
+		k.import2fas(file)
+		return
+	}
+	if flag.NArg() == 0 && !*flagAdd {
 		k.showAll()
 		return
 	}
@@ -126,13 +136,7 @@ func main() {
 		usage()
 	}
 	name := flag.Arg(0)
-	if strings.IndexFunc(name, unicode.IsSpace) >= 0 {
-		log.Fatal("name must not contain spaces")
-	}
 	if *flagAdd {
-		if *flagClip {
-			usage()
-		}
 		k.add(name)
 		return
 	}
@@ -152,6 +156,50 @@ type Key struct {
 }
 
 const counterLen = 20
+
+// fuzzyMatch finds keys that fuzzy match the search string
+func (c *Keychain) fuzzyMatch(search string) []string {
+	var allNames []string
+	for name := range c.keys {
+		allNames = append(allNames, name)
+	}
+
+	// Convert search to lowercase for case-insensitive matching
+	search = strings.ToLower(search)
+	
+	// Create lowercase version of all names for matching
+	lowerNames := make([]string, len(allNames))
+	for i, name := range allNames {
+		lowerNames[i] = strings.ToLower(name)
+	}
+
+	// First try fuzzy.RankFind for fuzzy matches on lowercase names
+	ranks := fuzzy.RankFind(search, lowerNames)
+
+	if len(ranks) > 0 {
+		var matches []string
+		for _, rank := range ranks {
+			// Find the original name (with correct case) using the index
+			for i, lowerName := range lowerNames {
+				if lowerName == rank.Target {
+					matches = append(matches, allNames[i])
+					break
+				}
+			}
+		}
+		return matches
+	}
+
+	// Fallback to simple substring matching if no fuzzy matches
+	var matches []string
+	for name := range c.keys {
+		if strings.Contains(strings.ToLower(name), search) {
+			matches = append(matches, name)
+		}
+	}
+	sort.Strings(matches)
+	return matches
+}
 
 func readKeychain(file string) *Keychain {
 	c := &Keychain{
@@ -176,19 +224,35 @@ func readKeychain(file string) *Keychain {
 		if len(f) == 1 && len(f[0]) == 0 {
 			continue
 		}
-		if len(f) >= 3 && len(f[1]) == 1 && '6' <= f[1][0] && f[1][0] <= '8' {
+		// Changed: Handle names with spaces by looking for digit and secret pattern
+		// Format: name(s) digit secret [counter]
+		// Find the digit position (should be '6', '7', or '8')
+		digitPos := -1
+		for i := len(f) - 1; i >= 1; i-- {
+			if len(f[i]) == 1 && '6' <= f[i][0] && f[i][0] <= '8' {
+				// Check if next field looks like a base32 secret
+				if i+1 < len(f) && len(f[i+1]) > 0 {
+					digitPos = i
+					break
+				}
+			}
+		}
+
+		if digitPos >= 1 && digitPos+1 < len(f) {
 			var k Key
-			name := string(f[0])
-			k.digits = int(f[1][0] - '0')
-			raw, err := decodeKey(string(f[2]))
+			// Name is everything before digitPos, joined with spaces
+			nameParts := f[0:digitPos]
+			name := string(bytes.Join(nameParts, []byte(" ")))
+			k.digits = int(f[digitPos][0] - '0')
+			raw, err := decodeKey(string(f[digitPos+1]))
 			if err == nil {
 				k.raw = raw
-				if len(f) == 3 {
+				if len(f) == digitPos+2 {
 					c.keys[name] = k
 					continue
 				}
-				if len(f) == 4 && len(f[3]) == counterLen {
-					_, err := strconv.ParseUint(string(f[3]), 10, 64)
+				if len(f) == digitPos+3 && len(f[digitPos+2]) == counterLen {
+					_, err := strconv.ParseUint(string(f[digitPos+2]), 10, 64)
 					if err == nil {
 						// Valid counter.
 						k.offset = offset - counterLen
@@ -250,20 +314,57 @@ func (c *Keychain) add(name string) {
 	if *flagHotp {
 		line += " " + strings.Repeat("0", 20)
 	}
-	line += "\n"
 
-	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
-	if err != nil {
-		log.Fatalf("opening keychain: %v", err)
+	// Add to keychain map
+	c.keys[name] = Key{} // Temporary entry for sorting
+
+	// Rewrite entire file in sorted order
+	if err := c.rewriteSorted([]string{line}); err != nil {
+		log.Fatalf("adding key: %v", err)
 	}
+}
+
+// rewriteSorted rewrites the entire keychain file in sorted order
+func (c *Keychain) rewriteSorted(newEntries []string) error {
+	// Read all existing lines
+	var existingLines []string
+	if len(c.data) > 0 {
+		lines := bytes.Split(bytes.TrimSuffix(c.data, []byte("\n")), []byte("\n"))
+		for _, line := range lines {
+			if len(line) > 0 {
+				existingLines = append(existingLines, string(line))
+			}
+		}
+	}
+
+	// Combine existing and new entries
+	allLines := append(existingLines, newEntries...)
+
+	// Sort all lines by name (first field)
+	sort.Slice(allLines, func(i, j int) bool {
+		partsI := strings.Split(allLines[i], " ")
+		partsJ := strings.Split(allLines[j], " ")
+		if len(partsI) > 0 && len(partsJ) > 0 {
+			return strings.ToLower(partsI[0]) < strings.ToLower(partsJ[0])
+		}
+		return allLines[i] < allLines[j]
+	})
+
+	// Write sorted entries to file
+	f, err := os.OpenFile(c.file, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("opening keychain: %v", err)
+	}
+	defer f.Close()
 	f.Chmod(0600)
 
-	if _, err := f.Write([]byte(line)); err != nil {
-		log.Fatalf("adding key: %v", err)
+	for _, line := range allLines {
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			return fmt.Errorf("writing keychain: %v", err)
+		}
 	}
-	if err := f.Close(); err != nil {
-		log.Fatalf("adding key: %v", err)
-	}
+
+	return nil
 }
 
 func (c *Keychain) code(name string) string {
@@ -297,11 +398,41 @@ func (c *Keychain) code(name string) string {
 }
 
 func (c *Keychain) show(name string) {
-	code := c.code(name)
-	if *flagClip {
+	// Try exact match first
+	if _, ok := c.keys[name]; ok {
+		code := c.code(name)
 		clipboard.WriteAll(code)
+		fmt.Printf("copied\t%s\t%s\n", code, name)
+		return
 	}
-	fmt.Printf("%s\n", code)
+
+	// Try fuzzy match
+	matches := c.fuzzyMatch(name)
+	if len(matches) == 0 {
+		log.Fatalf("no such key %q", name)
+	}
+	if len(matches) == 1 {
+		// Single match found
+		matchName := matches[0]
+		code := c.code(matchName)
+		clipboard.WriteAll(code)
+		fmt.Printf("copied\t%s\t%s\n", code, matchName)
+		return
+	}
+
+	// Multiple matches - show all
+	fmt.Fprintf(os.Stderr, "multiple matches found for %q:\n", name)
+	max := 0
+	for _, match := range matches {
+		if k := c.keys[match]; max < k.digits {
+			max = k.digits
+		}
+	}
+	for _, match := range matches {
+		code := c.code(match)
+		fmt.Printf("%-*s\t%s\n", max, code, match)
+	}
+	os.Exit(1)
 }
 
 func (c *Keychain) showAll() {
