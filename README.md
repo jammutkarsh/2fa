@@ -1,5 +1,13 @@
 # 2fa is a two-factor authentication agent
 
+## Table of Contents
+
+- [Supported Imports](#supported-imports)
+- [Usage](#usage)
+- [Example](#example)
+- [Importing from 2FAS](#importing-from-2fas)
+- [Fuzzy Matching](#fuzzy-matching)
+
 `2fa` is a command-line tool for managing two-factor authentication keys
 
 ## Supported Imports
